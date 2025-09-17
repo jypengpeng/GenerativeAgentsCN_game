@@ -73,18 +73,45 @@ class SimulateServer:
         for i in range(self.start_step, self.start_step + step):
             title = "Simulate Step[{}/{}, time: {}]".format(i+1, self.start_step + step, timer.get_date())
             self.logger.info("\n" + utils.split_line(title, "="))
-            for name, status in self.agent_status.items():
-                plan = self.game.agent_think(name, status)["plan"]
-                agent = self.game.get_agent(name)
-                if name not in self.config["agents"]:
-                    self.config["agents"][name] = {}
-                self.config["agents"][name].update(agent.to_dict())
-                if plan.get("path"):
-                    status["coord"], status["path"] = plan["path"][-1], []
-                self.config["agents"][name].update(
-                    # {"coord": status["coord"], "path": plan["path"]}
-                    {"coord": status["coord"]}
-                )
+            # 并行进行需要生成日程的 Agent 的 schedule 制定
+            try:
+                unscheduled = [a for a in self.game.agents.values() if not a.schedule.scheduled()]
+                if unscheduled:
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    max_workers = min(len(unscheduled), (os.cpu_count() or 4))
+                    self.logger.info(f"Parallel making schedule for {len(unscheduled)} agents (workers={max_workers})...")
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {executor.submit(a.make_schedule): a.name for a in unscheduled}
+                        for fut in futures:
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                self.logger.warning(f"make_schedule failed for {futures[fut]}: {e}")
+            except Exception as e:
+                self.logger.warning(f"parallel make_schedule encountered error: {e}")
+            # 分组：按 arena 组内顺序，组间并行结算
+            groups = self.game.group_agents(use_llm=False)
+            self.logger.info(f"Agent groups: {groups}")
+            from concurrent.futures import ThreadPoolExecutor
+            def _run_group(agent_names):
+                for name in agent_names:
+                    status = self.agent_status[name]
+                    plan = self.game.agent_think(name, status)["plan"]
+                    agent = self.game.get_agent(name)
+                    if name not in self.config["agents"]:
+                        self.config["agents"][name] = {}
+                    self.config["agents"][name].update(agent.to_dict())
+                    if plan.get("path"):
+                        status["coord"], status["path"] = plan["path"][-1], []
+                    self.config["agents"][name].update({"coord": status["coord"]})
+
+            max_workers = min(len(groups), (os.cpu_count() or 4)) or 1
+            if max_workers <= 1:
+                for g in groups:
+                    _run_group(g)
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    list(executor.map(_run_group, groups))
 
             sim_time = timer.get_date("%Y%m%d-%H:%M")
             self.config.update(
@@ -93,12 +120,26 @@ class SimulateServer:
                     "step": i + 1,
                 }
             )
-            # 保存Agent活动数据
-            with open(f"{self.checkpoints_folder}/simulate-{sim_time.replace(':', '')}.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.config, indent=2, ensure_ascii=False))
-            # 保存对话数据
-            with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(self.game.conversation, indent=2, ensure_ascii=False))
+            # 并行后台保存数据，避免阻塞仿真主循环
+            try:
+                from concurrent.futures import ThreadPoolExecutor
+                if not hasattr(self, "_io_pool"):
+                    self._io_pool = ThreadPoolExecutor(max_workers=2)
+                sim_path = f"{self.checkpoints_folder}/simulate-{sim_time.replace(':', '')}.json"
+                conv_path = f"{self.checkpoints_folder}/conversation.json"
+                data_config = json.dumps(self.config, indent=2, ensure_ascii=False)
+                data_conv = json.dumps(self.game.conversation, indent=2, ensure_ascii=False)
+                def _write(path, data):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(data)
+                self._io_pool.submit(_write, sim_path, data_config)
+                self._io_pool.submit(_write, conv_path, data_conv)
+            except Exception as e:
+                # 退化为同步写
+                with open(f"{self.checkpoints_folder}/simulate-{sim_time.replace(':', '')}.json", "w", encoding="utf-8") as f:
+                    f.write(json.dumps(self.config, indent=2, ensure_ascii=False))
+                with open(f"{self.checkpoints_folder}/conversation.json", "w", encoding="utf-8") as f:
+                    f.write(json.dumps(self.game.conversation, indent=2, ensure_ascii=False))
 
             if stride > 0:
                 timer.forward(stride)

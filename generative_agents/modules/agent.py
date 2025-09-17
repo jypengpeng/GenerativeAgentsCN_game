@@ -143,6 +143,9 @@ class Agent:
             if self.action.finished():
                 self.action = self._determine_action()
 
+        # 更新存在感信息（位置与动作摘要）
+        self.get_presence()
+
         emojis = {}
         if self.action:
             emojis[self.name] = {"emoji": self.get_event().emoji, "coord": self.coord}
@@ -534,10 +537,18 @@ class Agent:
 
         self.logger.info("{} decides chat with {}".format(self.name, other.name))
         start, chats = utils.get_timer().get_date(), []
-        relations = [
-            self.completion("summarize_relation", self, other.name),
-            other.completion("summarize_relation", other, self.name),
-        ]
+        # 并行总结双方关系（使用各自的 LLM，不共享状态）
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                fut_self = executor.submit(self.completion, "summarize_relation", self, other.name)
+                fut_other = executor.submit(other.completion, "summarize_relation", other, self.name)
+                relations = [fut_self.result(), fut_other.result()]
+        except Exception:
+            relations = [
+                self.completion("summarize_relation", self, other.name),
+                other.completion("summarize_relation", other, self.name),
+            ]
 
         for i in range(self.chat_iter):
             text = self.completion(
@@ -583,9 +594,23 @@ class Agent:
                 break
 
         key = utils.get_timer().get_date("%Y%m%d-%H:%M")
-        if key not in self.conversation.keys():
-            self.conversation[key] = []
-        self.conversation[key].append({f"{self.name} -> {other.name} @ {'，'.join(self.get_event().address)}": chats})
+        # 使用全局 Game 上的会话锁保护写入
+        try:
+            from modules.utils import GenerativeAgentsMap, GenerativeAgentsKey
+            game = GenerativeAgentsMap.get(GenerativeAgentsKey.GAME)
+            if game and hasattr(game, "conversation_lock"):
+                with game.conversation_lock:
+                    if key not in self.conversation.keys():
+                        self.conversation[key] = []
+                    self.conversation[key].append({f"{self.name} -> {other.name} @ {'，'.join(self.get_event().address)}": chats})
+            else:
+                if key not in self.conversation.keys():
+                    self.conversation[key] = []
+                self.conversation[key].append({f"{self.name} -> {other.name} @ {'，'.join(self.get_event().address)}": chats})
+        except Exception:
+            if key not in self.conversation.keys():
+                self.conversation[key] = []
+            self.conversation[key].append({f"{self.name} -> {other.name} @ {'，'.join(self.get_event().address)}": chats})
 
         self.logger.info(
             "{} and {} has chats\n  {}".format(
@@ -678,6 +703,27 @@ class Agent:
         if self.get_event().fit(self.name, "正在", "睡觉"):
             return False
         return True
+
+    def get_presence(self):
+        """返回该 Agent 的位置与动作摘要，并同步写入 status.presence"""
+        tile = self.get_tile()
+        arena = tile.address_map.get("arena") if tile.has_address("arena") else None
+        obj = tile.address_map.get("game_object") if tile.has_address("game_object") else None
+        action = self.get_event().get_describe(False)
+        target = ":".join(self.get_event().address) if self.get_event().address else None
+        presence = {
+            "name": self.name,
+            "arena": arena,
+            "object": obj,
+            "coord": list(self.coord) if self.coord is not None else None,
+            "action": action,
+            "target": target,
+            "path_len": len(self.path) if self.path else 0,
+            "awake": self.is_awake(),
+            "time": utils.get_timer().get_date("%Y%m%d-%H:%M"),
+        }
+        self.status["presence"] = presence
+        return presence
 
     def llm_available(self):
         if not self._llm:

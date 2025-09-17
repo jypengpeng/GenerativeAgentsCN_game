@@ -1,3 +1,91 @@
+简体中文
+
+# 会呼吸的世界：Generative Agents CN（Fork）
+
+用 LLM 打造一个玩家可以进入其中扮演、会呼吸的世界。
+
+在这个分支中，我更关注“可玩性与扩展性”：让智能体的行为更具连贯性、世界运行更高效，并逐步把“玩家可参与的、持续演化的模拟世界”落到工程实践里。
+
+> 本项目基于并致敬上游仓库：[x-glacier/GenerativeAgentsCN](https://github.com/x-glacier/GenerativeAgentsCN)。本 README 只阐述本分支新增/变化的部分，不重复上游文档。
+
+## 这份 Fork 带来了什么
+
+- 全量直传记忆（适配超长上下文模型）
+  - 记忆检索改为“无向量化”模式（`provider: none`），将角色的全部相关记忆直接传给 LLM，适配长上下文模型，避免额外的 embedding 依赖与部署成本。
+
+- 并行分组结算（提升多人/多场景帧率）
+  - 每步开始前为每个角色生成一个极简“存在感”摘要（位置与动作）。
+  - 按 `arena` 将“可能发生交互”的角色分组：组内保持原有顺序结算，组与组之间并行执行，显著缩短多场景下的等待时间。
+  - 组内写 `maze/schedule/memory` 的副作用语义保持不变；全局对话写入加锁，避免并发冲突。
+
+- 关键路径并行化
+  - 并行初始化：启动时并行 `agent.reset()`。
+  - 并行日程生成：未建立日程的角色并行 `make_schedule()`。
+  - 并行关系摘要：对话前的双边 `summarize_relation` 并行以降低等待。
+
+- 异步持久化
+  - 每步模拟结束时以后台线程写出 `simulate-*.json` 与 `conversation.json`，减少 IO 阻塞。
+
+## 愿景（Vision）
+
+“一个玩家可以进入其中扮演的、会呼吸的世界”。
+
+- 由 LLM 驱动的日常/社交/目标形成，保持可解释与可控。
+- 玩家可作为“特殊智能体”介入，遵循同一规则与世界互动。
+- 世界状态持久化，昼夜循环与长期记忆带来连续性与沉浸感。
+
+## 快速开始（与上游保持一致的基础流程）
+
+1) 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+2) 配置 LLM（示例：OpenAI 兼容接口或本地 Ollama）
+
+- 在 `generative_agents/data/config.json` 中设置：
+  - `agent.think.llm`: 选择 `openai` 或 `ollama`，按需填写 `base_url/model/api_key`。
+  - `agent.associate.embedding.provider`: 设为 `none`（启用“全量直传记忆”）。
+
+3) 运行虚拟小镇
+
+```bash
+cd generative_agents
+python start.py --name sim-test --start "20250213-09:30" --step 10 --stride 10
+```
+
+> 更多运行、回放与地图说明参见上游文档与源码注释；本分支默认开启“分组并行结算”，日志中会打印分组情况。
+
+## 运行机制简述
+
+1) 每步开始：为所有角色生成 presence（位置、动作、坐标、目标等）。
+2) 分组：按 `arena` 进行规则分组（可扩展为 LLM 分组并做规则校验）。
+3) 执行：
+   - 组内：沿用原有 `agent_think` 顺序结算（确保语义一致）。
+   - 组间：多线程并行执行，`conversation` 写入加锁。
+4) 持久化：异步写出本步的世界快照与对话日志。
+
+## 配置要点
+
+- 长上下文模型：将 `agent.associate.embedding.provider` 设为 `none`，项目会在记忆阶段“全量直传”，规避 `/v1/embeddings` 的依赖。
+- 并行度：并行执行使用 `ThreadPoolExecutor`，默认按硬件核数与在线角色规模自适应。
+
+## 路线图（Roadmap）
+
+- LLM 辅助分组：在规则分组之上，引入可选的 LLM 分组策略，用于复杂社交场景的预测。
+- 跨场景协作：引入“两阶段提交”式的行动合并，支持跨 `arena` 的并行移动与占用协调。
+- 玩家化身：将玩家输入融入行动/对话决策，提供“扮演—反馈—记忆”的统一接口。
+- 模组化事件系统：以插件形式扩展职业、物件、社交规则。
+
+## 鸣谢
+
+- 上游仓库与作者：[x-glacier/GenerativeAgentsCN](https://github.com/x-glacier/GenerativeAgentsCN)
+
+## 许可证
+
+沿用上游仓库的 Apache-2.0 许可。
+
 简体中文 | [English](./README_en.md)
 
 # 生成式智能体（Generative Agents）深度汉化版

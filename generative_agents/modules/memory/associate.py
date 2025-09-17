@@ -133,6 +133,7 @@ class Associate:
         relevance_weight=3,
         importance_weight=2,
         memory=None,
+        retrieve_all=False,
     ):
         self._index = LlamaIndex(embedding, path)
         self.memory = memory or {"event": [], "thought": [], "chat": []}
@@ -140,6 +141,8 @@ class Associate:
         self.retention = retention
         self.max_memory = max_memory
         self.max_importance = max_importance
+        # 当 embedding.provider == 'none' 或外部指定 retrieve_all=True 时，走全量直传
+        self._retrieve_all = retrieve_all or (embedding.get("provider") == "none")
         self._retrieve_config = {
             "recency_decay": recency_decay,
             "recency_weight": recency_weight,
@@ -200,6 +203,10 @@ class Associate:
         return self.to_concept(self._index.find_node(node_id))
 
     def _retrieve_nodes(self, node_type, text=None):
+        if self._retrieve_all:
+            # 全量返回该类型的所有节点，保持最近写入在前（memory 列表已是新在前）
+            nodes = [self._index.find_node(n) for n in self.memory[node_type]]
+            return [self.to_concept(n) for n in nodes]
         if text:
             filters = MetadataFilters(
                 filters=[ExactMatchFilter(key="node_type", value=node_type)]
@@ -218,10 +225,32 @@ class Associate:
         return self._retrieve_nodes("thought", text)
 
     def retrieve_chats(self, name=None):
+        if self._retrieve_all:
+            nodes = [self._index.find_node(n) for n in self.memory["chat"]]
+            if name:
+                nodes = [n for n in nodes if n.metadata.get("object") == name or n.metadata.get("subject") == name]
+            return [self.to_concept(n) for n in nodes]
         text = ("对话 " + name) if name else None
         return self._retrieve_nodes("chat", text)
 
     def retrieve_focus(self, focus, retrieve_max=30, reduce_all=True):
+        if self._retrieve_all:
+            # 全量返回 event + thought
+            node_ids = self.memory["event"] + self.memory["thought"]
+            # 去重但保持顺序（memory中新在前）
+            seen, ordered = set(), []
+            for nid in node_ids:
+                if nid in seen:
+                    continue
+                seen.add(nid)
+                ordered.append(self._index.find_node(nid))
+            if reduce_all:
+                return [self.to_concept(n) for n in ordered]
+            result = {}
+            for t in focus:
+                result[t] = [self.to_concept(n) for n in ordered]
+            return result
+
         def _create_retriever(*args, **kwargs):
             self._retrieve_config["retrieve_max"] = retrieve_max
             return AssociateRetriever(self._retrieve_config, *args, **kwargs)
